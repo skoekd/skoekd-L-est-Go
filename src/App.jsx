@@ -1,12 +1,18 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Shuffle, Trophy, Plus, X, RotateCcw, Download, History } from 'lucide-react';
+import { Users, Shuffle, Trophy, Plus, X, RotateCcw, Download, History, Copy, LogOut, Wifi, WifiOff } from 'lucide-react';
+import { supabase, generateTournamentCode } from './supabaseClient';
 
-// Constants
 const STARTING_CUPS = 10;
-const STORAGE_KEY = 'beerPongTournament';
 
 export default function App() {
-  const [screen, setScreen] = useState('setup');
+  // Connection state
+  const [screen, setScreen] = useState('join');
+  const [tournamentCode, setTournamentCode] = useState('');
+  const [joinCode, setJoinCode] = useState('');
+  const [connected, setConnected] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  
+  // Tournament state
   const [players, setPlayers] = useState([]);
   const [newPlayerName, setNewPlayerName] = useState('');
   const [teams, setTeams] = useState([]);
@@ -15,41 +21,145 @@ export default function App() {
   const [tournamentRound, setTournamentRound] = useState(1);
   const [bracketMode, setBracketMode] = useState(false);
 
-  // Load from localStorage
+  // Real-time subscription
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        const data = JSON.parse(saved);
-        if (data.players) setPlayers(data.players);
-        if (data.teams) setTeams(data.teams);
-        if (data.games) setGames(data.games);
-        if (data.currentGame) setCurrentGame(data.currentGame);
-        if (data.screen) setScreen(data.screen);
-        if (data.tournamentRound) setTournamentRound(data.tournamentRound);
-        if (data.bracketMode) setBracketMode(data.bracketMode);
-      } catch (e) {
-        console.error('Failed to load:', e);
-      }
-    }
-  }, []);
+    if (!tournamentCode) return;
 
-  // Save to localStorage
+    const channel = supabase
+      .channel(`tournament-${tournamentCode}`)
+      .on('postgres_changes', 
+        { 
+          event: '*', 
+          schema: 'public', 
+          table: 'tournaments', 
+          filter: `tournament_code=eq.${tournamentCode}` 
+        },
+        (payload) => {
+          if (payload.new?.tournament_data) {
+            loadTournamentData(payload.new.tournament_data);
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [tournamentCode]);
+
+  const loadTournamentData = (data) => {
+    if (data.players) setPlayers(data.players);
+    if (data.teams) setTeams(data.teams);
+    if (data.games) setGames(data.games);
+    if (data.currentGame) setCurrentGame(data.currentGame);
+    if (data.tournamentRound) setTournamentRound(data.tournamentRound);
+    if (data.bracketMode !== undefined) setBracketMode(data.bracketMode);
+    if (data.screen) setScreen(data.screen);
+  };
+
+  const saveTournamentData = async () => {
+    if (!tournamentCode) return;
+
+    const data = {
+      players,
+      teams,
+      games,
+      currentGame,
+      tournamentRound,
+      bracketMode,
+      screen: currentGame ? 'games' : screen
+    };
+
+    await supabase
+      .from('tournaments')
+      .update({ 
+        tournament_data: data,
+        updated_at: new Date().toISOString()
+      })
+      .eq('tournament_code', tournamentCode);
+  };
+
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        players, teams, games, screen: currentGame ? 'games' : screen, 
-        currentGame, tournamentRound, bracketMode
-      }));
-    } catch (e) {
-      console.error('Save failed:', e);
+    if (tournamentCode && connected) {
+      saveTournamentData();
     }
-  }, [players, teams, games, screen, currentGame, tournamentRound, bracketMode]);
+  }, [players, teams, games, currentGame, tournamentRound, bracketMode, screen]);
+
+  const createTournament = async () => {
+    setIsLoading(true);
+    const code = generateTournamentCode();
+    
+    const { error } = await supabase
+      .from('tournaments')
+      .insert({
+        tournament_code: code,
+        tournament_data: {
+          players: [],
+          teams: [],
+          games: [],
+          currentGame: null,
+          tournamentRound: 1,
+          bracketMode: false,
+          screen: 'setup'
+        }
+      });
+
+    setIsLoading(false);
+
+    if (error) {
+      alert('Error: ' + error.message);
+      return;
+    }
+
+    setTournamentCode(code);
+    setConnected(true);
+    setScreen('setup');
+  };
+
+  const joinTournament = async () => {
+    if (!joinCode || joinCode.length !== 4) {
+      alert('Enter 4-digit code');
+      return;
+    }
+
+    setIsLoading(true);
+    const { data, error } = await supabase
+      .from('tournaments')
+      .select('*')
+      .eq('tournament_code', joinCode)
+      .single();
+
+    setIsLoading(false);
+
+    if (error || !data) {
+      alert('Tournament not found!');
+      return;
+    }
+
+    setTournamentCode(joinCode);
+    setConnected(true);
+    loadTournamentData(data.tournament_data);
+  };
+
+  const leaveTournament = () => {
+    if (!confirm('Leave tournament?')) return;
+    setTournamentCode('');
+    setConnected(false);
+    setScreen('join');
+    setPlayers([]);
+    setTeams([]);
+    setGames([]);
+  };
+
+  const copyCode = () => {
+    navigator.clipboard.writeText(tournamentCode);
+    alert('Copied: ' + tournamentCode);
+  };
 
   const addPlayer = () => {
     if (newPlayerName.trim()) {
       if (players.some(p => p.name.toLowerCase() === newPlayerName.trim().toLowerCase())) {
-        alert('Player already exists!');
+        alert('Player exists!');
         return;
       }
       setPlayers([...players, { id: Date.now(), name: newPlayerName.trim() }]);
@@ -58,7 +168,7 @@ export default function App() {
   };
 
   const removePlayer = (id) => {
-    if (teams.length > 0 && !confirm('Reset all teams and games?')) return;
+    if (teams.length > 0 && !confirm('Reset all?')) return;
     setPlayers(players.filter(p => p.id !== id));
     if (teams.length > 0) {
       setTeams([]);
@@ -68,10 +178,10 @@ export default function App() {
 
   const generateTeams = () => {
     if (players.length < 2) {
-      alert('Need at least 2 players!');
+      alert('Need 2+ players!');
       return;
     }
-    if (players.length % 2 !== 0 && !confirm(`${players.length} players (odd). One sits out. Continue?`)) {
+    if (players.length % 2 !== 0 && !confirm(`${players.length} players (odd). Continue?`)) {
       return;
     }
 
@@ -97,17 +207,17 @@ export default function App() {
     setScreen('teams');
   };
 
-  const matchupExists = (team1Id, team2Id) => {
+  const matchupExists = (t1, t2) => {
     return games.some(g => 
       g.completed &&
-      ((g.team1.id === team1Id && g.team2.id === team2.id) ||
-       (g.team1.id === team2Id && g.team2.id === team1.id))
+      ((g.team1.id === t1 && g.team2.id === t2) ||
+       (g.team1.id === t2 && g.team2.id === t1))
     );
   };
 
   const createGame = (team1, team2) => {
     if (currentGame) {
-      alert('Finish current game first!');
+      alert('Finish current game!');
       return;
     }
 
@@ -159,7 +269,7 @@ export default function App() {
     if (updated.cupsRemaining1 === 0 || updated.cupsRemaining2 === 0) {
       setTimeout(() => {
         const winner = updated.cupsRemaining1 === 0 ? updated.team1.name : updated.team2.name;
-        if (confirm(`${winner} wins! Complete game?`)) {
+        if (confirm(`${winner} wins! Complete?`)) {
           completeGame(gameId);
         }
       }, 500);
@@ -170,8 +280,6 @@ export default function App() {
     const game = games.find(g => g.id === gameId);
     if (!game) return;
 
-    if (game.cupsRemaining1 === game.cupsRemaining2 && !confirm("Tied! Complete anyway?")) return;
-    
     const completed = { ...game, completed: true, endTime: Date.now() };
     setGames(games.map(g => g.id === gameId ? completed : g));
     
@@ -204,14 +312,14 @@ export default function App() {
   };
 
   const cancelGame = () => {
-    if (!confirm('Cancel this game?')) return;
+    if (!confirm('Cancel game?')) return;
     setGames(games.filter(g => g.id !== currentGame.id));
     setCurrentGame(null);
     setScreen('teams');
   };
 
   const startNewRound = () => {
-    if (!confirm('Start new tournament round? Tournament wins will be kept.')) return;
+    if (!confirm('Start new round? Tournament wins kept.')) return;
     
     setTeams(teams.map(t => ({
       ...t,
@@ -227,13 +335,13 @@ export default function App() {
   };
 
   const startBracket = () => {
-    const sortedTeams = [...teams].sort((a, b) => {
+    const sorted = [...teams].sort((a, b) => {
       if (b.roundWins !== a.roundWins) return b.roundWins - a.roundWins;
       return b.cupsScored - a.cupsScored;
     });
 
-    if (sortedTeams.length < 4) {
-      alert('Need at least 4 teams for bracket!');
+    if (sorted.length < 4) {
+      alert('Need 4+ teams!');
       return;
     }
 
@@ -244,9 +352,9 @@ export default function App() {
   const exportResults = () => {
     const data = {
       tournament: "L'EST GO Beer Pong",
+      code: tournamentCode,
       date: new Date().toISOString(),
       round: tournamentRound,
-      players,
       teams: teams.map(t => ({
         name: t.name,
         tournamentWins: t.tournamentWins,
@@ -261,25 +369,44 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `lest-go-beer-pong-${new Date().toISOString().split('T')[0]}.json`;
+    a.download = `lest-go-${tournamentCode}-${new Date().toISOString().split('T')[0]}.json`;
     a.click();
-    URL.revokeObjectURL(url);
   };
 
-  const formatDuration = (startTime, endTime) => {
-    const duration = Math.floor((endTime - startTime) / 1000 / 60);
-    return `${duration} min`;
+  const formatDuration = (start, end) => {
+    return `${Math.floor((end - start) / 60000)} min`;
   };
 
-  // Setup Screen
-  if (screen === 'setup') {
+  // Tournament Header Component
+  const TournamentHeader = () => (
+    <div className="bg-white/90 backdrop-blur rounded-xl p-3 mb-4 shadow-lg flex items-center justify-between">
+      <div className="flex items-center gap-3">
+        {connected ? <Wifi className="w-5 h-5 text-green-500" /> : <WifiOff className="w-5 h-5 text-red-500" />}
+        <div>
+          <div className="text-xs text-slate-600">Code</div>
+          <div className="text-2xl font-black text-slate-800 tracking-wider">{tournamentCode}</div>
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <button onClick={copyCode} className="p-2 bg-pink-500 hover:bg-pink-600 text-white rounded-lg transition">
+          <Copy className="w-5 h-5" />
+        </button>
+        <button onClick={leaveTournament} className="p-2 bg-slate-600 hover:bg-slate-700 text-white rounded-lg transition">
+          <LogOut className="w-5 h-5" />
+        </button>
+      </div>
+    </div>
+  );
+
+  // Join/Create Screen
+  if (screen === 'join' || !tournamentCode) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-teal-400 via-teal-300 to-cyan-400 p-4">
-        <div className="max-w-md mx-auto">
-          <div className="text-center mb-8 pt-6">
+      <div className="min-h-screen bg-gradient-to-br from-teal-400 via-teal-300 to-cyan-400 p-4 flex items-center justify-center">
+        <div className="max-w-md w-full">
+          <div className="text-center mb-8">
             <div className="bg-gradient-to-br from-slate-700 to-slate-800 rounded-3xl p-8 mb-4 shadow-2xl">
-              <h1 className="text-6xl font-black text-pink-400 mb-2" style={{fontFamily: 'Impact, sans-serif'}}>L'EST</h1>
-              <h1 className="text-6xl font-black text-pink-400 mb-4" style={{fontFamily: 'Impact, sans-serif'}}>GO</h1>
+              <h1 className="text-6xl font-black text-pink-400 mb-2">L'EST</h1>
+              <h1 className="text-6xl font-black text-pink-400 mb-4">GO</h1>
               <div className="text-white text-xl font-bold space-y-1">
                 <div>Sutton</div>
                 <div>Orford</div>
@@ -290,10 +417,59 @@ export default function App() {
             <h2 className="text-3xl font-bold text-slate-800">🍺 Beer Pong 🍺</h2>
           </div>
 
+          <div className="bg-white/90 backdrop-blur rounded-2xl p-6 mb-4 shadow-xl">
+            <h3 className="text-xl font-bold text-slate-800 mb-4">Create Tournament</h3>
+            <button
+              onClick={createTournament}
+              disabled={isLoading}
+              className="w-full py-4 bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 disabled:from-gray-400 disabled:to-gray-500 text-white rounded-xl font-black text-lg transition shadow-lg"
+            >
+              {isLoading ? 'Creating...' : 'Create New Tournament'}
+            </button>
+            <p className="text-sm text-slate-600 mt-2 text-center">Get a 4-digit code to share</p>
+          </div>
+
+          <div className="bg-white/90 backdrop-blur rounded-2xl p-6 shadow-xl">
+            <h3 className="text-xl font-bold text-slate-800 mb-4">Join Tournament</h3>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value)}
+                placeholder="CODE"
+                maxLength={4}
+                className="flex-1 px-4 py-3 rounded-xl border-2 border-slate-300 focus:border-pink-500 focus:outline-none text-center text-2xl font-bold tracking-widest uppercase"
+              />
+              <button
+                onClick={joinTournament}
+                disabled={isLoading}
+                className="px-6 py-3 bg-cyan-500 hover:bg-cyan-600 disabled:bg-gray-400 text-white rounded-xl font-bold transition"
+              >
+                {isLoading ? '...' : 'Join'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Setup Screen  
+  if (screen === 'setup') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-teal-400 via-teal-300 to-cyan-400 p-4">
+        <div className="max-w-md mx-auto">
+          <div className="pt-6"><TournamentHeader /></div>
+          
+          <div className="text-center mb-6">
+            <h1 className="text-4xl font-black text-slate-800 mb-2">L'EST GO</h1>
+            <h2 className="text-2xl font-bold text-pink-600">🍺 Beer Pong 🍺</h2>
+          </div>
+
           <div className="bg-white/90 backdrop-blur rounded-2xl p-6 mb-6 shadow-xl">
             <h3 className="text-xl font-bold text-slate-800 mb-4 flex items-center gap-2">
               <Users className="w-6 h-6" />
-              Add Players ({players.length})
+              Players ({players.length})
             </h3>
             
             <div className="flex gap-2 mb-4">
@@ -302,59 +478,39 @@ export default function App() {
                 value={newPlayerName}
                 onChange={(e) => setNewPlayerName(e.target.value)}
                 onKeyPress={(e) => e.key === 'Enter' && addPlayer()}
-                placeholder="Player name..."
+                placeholder="Name..."
                 className="flex-1 px-4 py-3 rounded-xl border-2 border-slate-300 focus:border-pink-500 focus:outline-none"
               />
-              <button
-                onClick={addPlayer}
-                className="px-6 py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-bold transition"
-              >
+              <button onClick={addPlayer} className="px-6 py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-bold transition">
                 <Plus className="w-5 h-5" />
               </button>
             </div>
 
             <div className="space-y-2 max-h-96 overflow-y-auto">
-              {players.map((player, index) => (
-                <div
-                  key={player.id}
-                  className="flex items-center justify-between bg-slate-100 rounded-xl p-3"
-                >
-                  <span className="text-slate-800 font-medium">
-                    {index + 1}. {player.name}
-                  </span>
-                  <button
-                    onClick={() => removePlayer(player.id)}
-                    className="text-red-500 hover:text-red-700 transition"
-                  >
+              {players.map((p, i) => (
+                <div key={p.id} className="flex items-center justify-between bg-slate-100 rounded-xl p-3">
+                  <span className="text-slate-800 font-medium">{i + 1}. {p.name}</span>
+                  <button onClick={() => removePlayer(p.id)} className="text-red-500 hover:text-red-700">
                     <X className="w-5 h-5" />
                   </button>
                 </div>
               ))}
             </div>
-
-            {players.length === 0 && (
-              <p className="text-slate-500 text-center py-4">No players yet</p>
-            )}
+            {players.length === 0 && <p className="text-slate-500 text-center py-4">No players</p>}
           </div>
 
           <button
             onClick={generateTeams}
             disabled={players.length < 2}
-            className="w-full py-4 bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 disabled:from-gray-400 disabled:to-gray-500 text-white rounded-2xl font-black text-lg transition shadow-lg disabled:cursor-not-allowed mb-3"
+            className="w-full py-4 bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 disabled:from-gray-400 disabled:to-gray-500 text-white rounded-2xl font-black text-lg transition shadow-lg mb-3"
           >
             <Shuffle className="w-6 h-6 inline mr-2" />
-            Generate Random Teams
+            Generate Teams
           </button>
           
-          {players.length < 2 && (
-            <p className="text-slate-700 text-center font-semibold">Add at least 2 players</p>
-          )}
-
+          {players.length < 2 && <p className="text-slate-700 text-center font-semibold">Add 2+ players</p>}
           {teams.length > 0 && (
-            <button
-              onClick={() => setScreen('teams')}
-              className="w-full py-3 bg-slate-700 hover:bg-slate-800 text-white rounded-xl font-bold transition"
-            >
+            <button onClick={() => setScreen('teams')} className="w-full py-3 bg-slate-700 hover:bg-slate-800 text-white rounded-xl font-bold transition">
               Continue Tournament
             </button>
           )}
@@ -363,72 +519,57 @@ export default function App() {
     );
   }
 
-  // Teams Screen (continued in next part due to length...)
+  // Teams Screen
   if (screen === 'teams') {
     return (
       <div className="min-h-screen bg-gradient-to-br from-teal-400 via-teal-300 to-cyan-400 p-4 pb-20">
         <div className="max-w-md mx-auto">
-          <div className="text-center mb-6 pt-6">
+          <div className="pt-6"><TournamentHeader /></div>
+          
+          <div className="text-center mb-6">
             <h1 className="text-4xl font-black text-slate-800 mb-1">L'EST GO</h1>
             <h2 className="text-2xl font-bold text-pink-600">Round {tournamentRound}</h2>
           </div>
 
           <div className="space-y-3 mb-6">
-            {teams.map((team, index) => (
-              <div
-                key={team.id}
-                className="bg-white/90 backdrop-blur rounded-2xl p-4 shadow-lg"
-              >
+            {teams.map((t, i) => (
+              <div key={t.id} className="bg-white/90 backdrop-blur rounded-2xl p-4 shadow-lg">
                 <div className="flex items-center justify-between mb-2">
-                  <h3 className="text-lg font-bold text-slate-800">Team {index + 1}</h3>
+                  <h3 className="text-lg font-bold text-slate-800">Team {i + 1}</h3>
                   <div className="text-right">
-                    <span className="text-pink-600 font-bold text-lg">{team.tournamentWins} 🏆</span>
-                    <div className="text-sm text-slate-600">
-                      {team.roundWins}W-{team.roundLosses}L
-                    </div>
+                    <span className="text-pink-600 font-bold text-lg">{t.tournamentWins} 🏆</span>
+                    <div className="text-sm text-slate-600">{t.roundWins}W-{t.roundLosses}L</div>
                   </div>
                 </div>
-                <p className="text-slate-800 font-medium mb-1">{team.name}</p>
-                <p className="text-slate-600 text-sm">{team.cupsScored} cups</p>
+                <p className="text-slate-800 font-medium mb-1">{t.name}</p>
+                <p className="text-slate-600 text-sm">{t.cupsScored} cups</p>
               </div>
             ))}
           </div>
 
           <div className="grid grid-cols-2 gap-3 mb-6">
-            <button
-              onClick={() => setScreen('results')}
-              className="py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-bold transition"
-            >
-              <Trophy className="w-5 h-5 inline mr-1" />
-              Results
+            <button onClick={() => setScreen('results')} className="py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-bold transition">
+              <Trophy className="w-5 h-5 inline mr-1" />Results
             </button>
-            <button
-              onClick={startBracket}
-              className="py-3 bg-purple-500 hover:bg-purple-600 text-white rounded-xl font-bold transition"
-            >
+            <button onClick={startBracket} className="py-3 bg-purple-500 hover:bg-purple-600 text-white rounded-xl font-bold transition">
               Bracket
             </button>
           </div>
 
           <div className="bg-white/90 backdrop-blur rounded-2xl p-6 mb-4 shadow-lg">
             <h3 className="text-xl font-bold text-slate-800 mb-4">Create Match</h3>
-            
             <div className="grid grid-cols-2 gap-3">
-              {teams.map((team1, i) => 
-                teams.slice(i + 1).map(team2 => {
-                  const hasPlayed = matchupExists(team1.id, team2.id);
+              {teams.map((t1, i) => 
+                teams.slice(i + 1).map(t2 => {
+                  const played = matchupExists(t1.id, t2.id);
                   return (
                     <button
-                      key={`${team1.id}-${team2.id}`}
-                      onClick={() => createGame(team1, team2)}
-                      className={`p-3 ${
-                        hasPlayed 
-                          ? 'bg-slate-200 text-slate-500' 
-                          : 'bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 text-white'
-                      } rounded-xl font-bold text-sm transition`}
+                      key={`${t1.id}-${t2.id}`}
+                      onClick={() => createGame(t1, t2)}
+                      className={`p-3 ${played ? 'bg-slate-200 text-slate-500' : 'bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 text-white'} rounded-xl font-bold text-sm transition`}
                     >
-                      T{i + 1} vs T{teams.indexOf(team2) + 1}
-                      {hasPlayed && <div className="text-xs mt-1">✓</div>}
+                      T{i + 1} vs T{teams.indexOf(t2) + 1}
+                      {played && <div className="text-xs mt-1">✓</div>}
                     </button>
                   );
                 })
@@ -436,10 +577,7 @@ export default function App() {
             </div>
           </div>
 
-          <button
-            onClick={() => setScreen('setup')}
-            className="w-full py-3 bg-slate-700 hover:bg-slate-800 text-white rounded-xl font-bold transition"
-          >
+          <button onClick={() => setScreen('setup')} className="w-full py-3 bg-slate-700 hover:bg-slate-800 text-white rounded-xl font-bold transition">
             Back to Setup
           </button>
         </div>
@@ -452,7 +590,9 @@ export default function App() {
     return (
       <div className="min-h-screen bg-gradient-to-br from-teal-400 via-teal-300 to-cyan-400 p-4">
         <div className="max-w-md mx-auto">
-          <div className="text-center mb-6 pt-6">
+          <div className="pt-6"><TournamentHeader /></div>
+          
+          <div className="text-center mb-6">
             <h1 className="text-3xl font-black text-slate-800 mb-2">🍺 Game On! 🍺</h1>
             <p className="text-slate-700 font-bold">First to 0 cups wins!</p>
           </div>
@@ -515,14 +655,10 @@ export default function App() {
             onClick={() => completeGame(currentGame.id)}
             className="w-full py-4 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white rounded-2xl font-black text-lg transition shadow-lg mb-3"
           >
-            <Trophy className="w-6 h-6 inline mr-2" />
-            Complete Game
+            <Trophy className="w-6 h-6 inline mr-2" />Complete Game
           </button>
 
-          <button
-            onClick={cancelGame}
-            className="w-full py-3 bg-red-500/80 hover:bg-red-600 text-white rounded-xl font-bold transition"
-          >
+          <button onClick={cancelGame} className="w-full py-3 bg-red-500/80 hover:bg-red-600 text-white rounded-xl font-bold transition">
             Cancel Game
           </button>
         </div>
@@ -530,12 +666,160 @@ export default function App() {
     );
   }
 
-  // Bracket & Results screens continue...
-  // (Truncated for length - full implementation in actual file)
-  
-  return <div className="min-h-screen bg-teal-400 flex items-center justify-center">
-    <button onClick={() => setScreen('setup')} className="px-6 py-3 bg-pink-500 text-white rounded-xl font-bold">
-      Back to Setup
-    </button>
-  </div>;
+  // Bracket Screen
+  if (screen === 'bracket') {
+    const sorted = [...teams].sort((a, b) => {
+      if (b.roundWins !== a.roundWins) return b.roundWins - a.roundWins;
+      return b.cupsScored - a.cupsScored;
+    }).slice(0, 4);
+
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-teal-400 via-teal-300 to-cyan-400 p-4 pb-20">
+        <div className="max-w-md mx-auto">
+          <div className="pt-6"><TournamentHeader /></div>
+          
+          <div className="text-center mb-6">
+            <h1 className="text-4xl font-black text-slate-800 mb-2">🏆 BRACKET 🏆</h1>
+            <p className="text-slate-700 font-bold">Top 4 Teams</p>
+          </div>
+
+          <div className="bg-white/90 rounded-2xl p-6 mb-4 shadow-lg">
+            <h3 className="text-center font-bold text-slate-600 mb-4">SEMIFINAL #1</h3>
+            <button
+              onClick={() => createGame(sorted[0], sorted[3])}
+              className="w-full py-4 bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 text-white rounded-xl font-bold transition"
+            >
+              {sorted[0]?.name || 'TBD'} vs {sorted[3]?.name || 'TBD'}
+            </button>
+          </div>
+
+          <div className="bg-white/90 rounded-2xl p-6 mb-4 shadow-lg">
+            <h3 className="text-center font-bold text-slate-600 mb-4">SEMIFINAL #2</h3>
+            <button
+              onClick={() => createGame(sorted[1], sorted[2])}
+              className="w-full py-4 bg-gradient-to-r from-pink-500 to-pink-600 hover:from-pink-600 hover:to-pink-700 text-white rounded-xl font-bold transition"
+            >
+              {sorted[1]?.name || 'TBD'} vs {sorted[2]?.name || 'TBD'}
+            </button>
+          </div>
+
+          <div className="text-center text-2xl font-black text-slate-800 my-6">↓ FINAL ↓</div>
+
+          <div className="bg-gradient-to-r from-yellow-400 to-yellow-500 rounded-2xl p-6 shadow-xl text-center mb-6">
+            <Trophy className="w-16 h-16 text-yellow-800 mx-auto mb-2" />
+            <p className="text-yellow-900 font-bold">Winners advance!</p>
+          </div>
+
+          <button onClick={() => setScreen('teams')} className="w-full py-3 bg-slate-700 hover:bg-slate-800 text-white rounded-xl font-bold transition">
+            Back to Teams
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Results Screen
+  if (screen === 'results') {
+    const sortedTournament = [...teams].sort((a, b) => {
+      if (b.tournamentWins !== a.tournamentWins) return b.tournamentWins - a.tournamentWins;
+      return b.cupsScored - a.cupsScored;
+    });
+    
+    const sortedRound = [...teams].sort((a, b) => {
+      if (b.roundWins !== a.roundWins) return b.roundWins - a.roundWins;
+      return b.cupsScored - a.cupsScored;
+    });
+
+    const completed = games.filter(g => g.completed);
+
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-teal-400 via-teal-300 to-cyan-400 p-4 pb-20">
+        <div className="max-w-md mx-auto">
+          <div className="pt-6"><TournamentHeader /></div>
+          
+          <div className="text-center mb-6">
+            <Trophy className="w-12 h-12 text-yellow-600 mx-auto mb-2" />
+            <h1 className="text-3xl font-black text-slate-800">Leaderboard</h1>
+          </div>
+
+          <div className="bg-white/90 backdrop-blur rounded-2xl p-6 mb-6 shadow-lg">
+            <h3 className="text-xl font-bold text-slate-800 mb-4">🏆 Tournament Overall</h3>
+            <div className="space-y-3">
+              {sortedTournament.map((t, i) => (
+                <div key={t.id} className={`p-4 rounded-xl ${i === 0 ? 'bg-gradient-to-r from-yellow-400 to-yellow-500' : 'bg-slate-100'}`}>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <span className="text-2xl font-black">{i === 0 ? '👑' : `#${i + 1}`}</span>
+                      <span className="font-bold text-slate-800">{t.name}</span>
+                    </div>
+                    <span className="text-2xl font-black text-slate-800">{t.tournamentWins} 🏆</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-white/90 backdrop-blur rounded-2xl p-6 mb-6 shadow-lg">
+            <h3 className="text-xl font-bold text-slate-800 mb-4">Round {tournamentRound}</h3>
+            <div className="space-y-3">
+              {sortedRound.map((t, i) => (
+                <div key={t.id} className="p-3 rounded-xl bg-slate-100">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-slate-800">#{i + 1} {t.name}</span>
+                    <span className="font-bold text-pink-600">{t.roundWins}W</span>
+                  </div>
+                  <div className="text-sm text-slate-600">{t.roundLosses}L • {t.cupsScored} cups</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {completed.length > 0 && (
+            <div className="bg-white/90 backdrop-blur rounded-2xl p-6 mb-6 shadow-lg">
+              <h3 className="text-xl font-bold text-slate-800 mb-4 flex items-center gap-2">
+                <History className="w-6 h-6" />Game History ({completed.length})
+              </h3>
+              <div className="space-y-3 max-h-96 overflow-y-auto">
+                {[...completed].reverse().map(g => (
+                  <div key={g.id} className="bg-slate-100 rounded-xl p-4">
+                    <div className="flex items-center justify-between text-sm mb-2">
+                      <span className={`font-medium ${g.cupsRemaining1 < g.cupsRemaining2 ? 'text-green-600 font-bold' : 'text-slate-600'}`}>
+                        {g.team1.name}
+                      </span>
+                      <span className="font-bold text-slate-800">
+                        {STARTING_CUPS - g.cupsRemaining1} - {STARTING_CUPS - g.cupsRemaining2}
+                      </span>
+                      <span className={`font-medium ${g.cupsRemaining2 < g.cupsRemaining1 ? 'text-green-600 font-bold' : 'text-slate-600'}`}>
+                        {g.team2.name}
+                      </span>
+                    </div>
+                    {g.endTime && (
+                      <div className="text-slate-500 text-xs text-center">
+                        {formatDuration(g.startTime, g.endTime)}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-3 mb-3">
+            <button onClick={() => setScreen('teams')} className="py-4 bg-pink-500 hover:bg-pink-600 text-white rounded-2xl font-bold transition">
+              Back
+            </button>
+            <button onClick={exportResults} className="py-4 bg-green-500 hover:bg-green-600 text-white rounded-2xl font-bold transition">
+              <Download className="w-5 h-5 inline mr-1" />Export
+            </button>
+          </div>
+
+          <button onClick={startNewRound} className="w-full py-4 bg-gradient-to-r from-purple-500 to-purple-600 hover:from-purple-600 hover:to-purple-700 text-white rounded-2xl font-black transition shadow-lg">
+            <RotateCcw className="w-5 h-5 inline mr-2" />Start Round {tournamentRound + 1}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }
